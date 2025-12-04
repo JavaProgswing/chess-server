@@ -35,3 +35,6 @@ build/
 /mvnw.cmd
 /.mvn/wrapper/maven-wrapper.properties
 /.gitattributes
+
+*.log
+.DS_Store
