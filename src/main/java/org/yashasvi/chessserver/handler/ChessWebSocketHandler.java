@@ -15,26 +15,36 @@ import org.yashasvi.chessserver.selenium.ChessSide;
 
 import java.nio.ByteBuffer;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 @Component
 public class ChessWebSocketHandler extends TextWebSocketHandler {
+
     private final ObjectMapper mapper = new ObjectMapper();
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
+
+    // Executor for async tasks (engine moves, bot loading)
+    private final ExecutorService asyncExecutor = Executors.newCachedThreadPool();
+
+    // Ping scheduler
     private final ScheduledExecutorService keepAliveScheduler = Executors.newSingleThreadScheduledExecutor();
 
     public ChessWebSocketHandler() {
         keepAliveScheduler.scheduleAtFixedRate(() -> {
             for (WebSocketSession session : sessions.values()) {
-                try {
-                    if (session.isOpen()) {
+                if (session.isOpen()) {
+                    try {
                         session.sendMessage(new PingMessage(ByteBuffer.wrap("".getBytes())));
+                    } catch (Exception e) {
+                        System.err.println("[WS] Could not ping session " + session.getId() + ": " + e.getMessage());
+                        sessions.remove(session.getId());
+                        try {
+                            session.close();
+                        } catch (Exception ignored) {
+                        }
                     }
-                } catch (Exception e) {
-                    System.err.println("[WS] Failed to send ping to " + session.getId() + ": " + e.getMessage());
+                } else {
+                    sessions.remove(session.getId());
                 }
             }
         }, 15, 15, TimeUnit.SECONDS);
@@ -47,235 +57,271 @@ public class ChessWebSocketHandler extends TextWebSocketHandler {
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) {
+        asyncExecutor.submit(() -> processMessage(session, message));
+    }
+
+    private void processMessage(WebSocketSession session, TextMessage message) {
         try {
             JsonNode data = mapper.readTree(message.getPayload());
             String action = data.path("action").asText();
 
             switch (action) {
-                case "ping" -> {
-                    session.sendMessage(new TextMessage("{\"type\":\"ping\", \"status\":\"Ok\"}"));
+                case "ping" -> safeSend(session, "{\"type\":\"ping\", \"status\":\"Ok\"}");
+
+                case "init" -> handleInit(session, data);
+
+                case "next_move" -> handleNextMove(session, data);
+
+                case "promote" -> handlePromote(session, data);
+
+                case "select_bot" -> handleSelectBot(session, data);
+
+                case "undo" -> handleUndo(session);
+
+                default -> safeSend(session, "{\"error\":\"Unknown action\"}");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /**
+     * Sends a message safely only if session is open
+     */
+    private void safeSend(WebSocketSession session, String payload) {
+        if (session.isOpen()) {
+            try {
+                session.sendMessage(new TextMessage(payload));
+            } catch (Exception e) {
+                System.err.println("[WS] Failed to send message: " + e.getMessage());
+                sessions.remove(session.getId());
+                try {
+                    session.close();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles initialization
+     */
+    private void handleInit(WebSocketSession session, JsonNode data) {
+        asyncExecutor.submit(() -> {
+            CountDownLatch botsLoadedLatch = new CountDownLatch(1);
+
+            try {
+                String pgn = data.has("pgn") && !data.get("pgn").isNull() ? data.get("pgn").asText() : null;
+
+                int moveNo = data.has("move_no") && !data.get("move_no").isNull() ? data.get("move_no").asInt() : -1;
+
+                ChessSide side;
+                ChessAutomator automator;
+
+                if (pgn != null) {
+                    automator = new ChessAutomator(new ChessGameAttrs(pgn, moveNo));
+                    side = automator.getSide();
+                } else {
+                    String sideStr = data.has("side") ? data.get("side").asText().toLowerCase() : "white";
+                    side = sideStr.equals("black") ? ChessSide.BLACK : ChessSide.WHITE;
+                    automator = new ChessAutomator(side);
                 }
 
-                case "init" -> {
-                    String pgn = data.has("pgn") && !data.get("pgn").isNull() ? data.get("pgn").asText() : null;
-                    int moveNo = data.has("move_no") && !data.get("move_no").isNull() ? data.get("move_no").asInt() : -1;
-                    String sideStr;
-                    ChessSide side;
+                session.getAttributes().put("automator", automator);
 
-                    // create new automator for this session
-                    ChessAutomator automator;
-                    if (pgn != null) {
-                        automator = new ChessAutomator(new ChessGameAttrs(pgn, moveNo));
-                        side = automator.getSide();
-                        sideStr = side == ChessSide.WHITE ? "white" : "black";
-                    } else {
-                        sideStr = data.has("side") ? data.get("side").asText().toLowerCase() : "white";
-                        side = sideStr.equals("black") ? ChessSide.BLACK : ChessSide.WHITE;
-                        automator = new ChessAutomator(side);
-                    }
-
-
-                    // save automator in session attributes
-                    session.getAttributes().put("automator", automator);
-                    while (automator.getEngineResult() == null) {
-                        try {
-                            Thread.sleep(100);
-                        } catch (Exception ignored) {
-                        }
-                        session.sendMessage(new PingMessage(ByteBuffer.wrap("".getBytes())));
-                    }
-                    if ((Boolean) automator.getEngineResult().get("engine_active")) {
-                        Map<java.lang.String, java.lang.Object> move = automator.getNextBestMove(null);
+                // ---------------- BOT LOADING (ASYNC) ----------------
+                asyncExecutor.submit(() -> {
+                    try {
+                        automator.loadBotList();
+                        while (!ChessAutomator.isLoaded()) Thread.sleep(250);
 
                         ObjectNode response = mapper.createObjectNode();
-                        if (move != null) {
-                            ObjectNode moveNode = mapper.createObjectNode();
-                            final String piece = (String) move.get("piece"), from = (String) move.get("from"), to = (String) move.get("to");
-                            moveNode.put("piece", piece);
-                            moveNode.put("from", from);
-                            moveNode.put("to", to);
-                            response.set("move", moveNode);
-                            response.put("type", "engine_move");
-                            response.put("status", piece + " to " + to);
+                        response.put("status", "Initialized as " + side.name());
+                        response.put("type", "init");
+                        response.put("side", side.name());
 
-                            ObjectNode stateWrapper = mapper.createObjectNode();
-                            stateWrapper.setAll((ObjectNode) mapper.valueToTree(move.get("state")));
-                            response.set("state", stateWrapper);
-                        } else {
-                            response.put("error", "No valid moves found or game over.");
+                        var botsArray = mapper.createArrayNode();
+                        for (Map<String, Object> bot : ChessAutomator.BOTS) {
+                            ObjectNode b = mapper.createObjectNode();
+                            b.put("id", (Integer) bot.get("id"));
+                            b.put("name", (String) bot.get("name"));
+                            if (bot.get("rating") != null) b.put("rating", bot.get("rating").toString());
+                            if (bot.get("avatar") != null) b.put("avatar", (String) bot.get("avatar"));
+                            b.put("is_engine", (Boolean) bot.get("is_engine"));
+                            botsArray.add(b);
                         }
 
-                        Executors.newSingleThreadExecutor().submit(() -> {
-                            try {
-                                while (!ChessAutomator.isLoaded()) {
-                                    try {
-                                        Thread.sleep(500);
-                                    } catch (Exception ignored) {
-                                    }
-                                }
-                                try {
-                                    Thread.sleep(500);
-                                } catch (Exception ignored) {
-                                }
-                                session.sendMessage(new TextMessage(response.toString()));
-                            } catch (Exception e) {
-                                e.printStackTrace();
-                            }
-                        });
+                        response.set("bots", botsArray);
+                        response.set("current_bot", mapper.valueToTree(automator.getSelectedBot()));
+
+                        ObjectNode stateWrapper = mapper.createObjectNode();
+                        stateWrapper.setAll((ObjectNode) mapper.valueToTree(automator.getReadableBoardState(automator.getInitialState())));
+                        response.set("state", stateWrapper);
+
+                        safeSend(session, response.toString());
+
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    } finally {
+                        // Always release the latch so the awaiting thread does not block indefinitely
+                        // if bot loading fails or an exception is thrown in this task.
+                        botsLoadedLatch.countDown();
                     }
-                    // run bot loading in a background thread
-                    Executors.newSingleThreadExecutor().submit(() -> {
-                        try {
-                            automator.loadBotList();
-                        } catch (Exception e) {
-                            throw new RuntimeException(e);
-                        }
+                });
 
-                        // wait until static flag is set
-                        int retry_count = 0;
-                        while (!ChessAutomator.isLoaded()) {
-                            try {
-                                final String statusMessage = "Loading bots" + ".".repeat(retry_count % 4);
-                                session.sendMessage(new TextMessage(String.format("{\"status\":\"%s\"}", statusMessage)));
-                                Thread.sleep(250);
-                                System.out.println("[WS] " + statusMessage);
-                            } catch (Exception ignored) {
-                            }
-                            retry_count++;
-                        }
+                // ---------------- ENGINE HANDLING ----------------
+                while (automator.getEngineResult() == null) Thread.sleep(100);
 
-                        try {
-                            ObjectNode response = mapper.createObjectNode();
-                            response.put("status", "Initialized as " + sideStr.toUpperCase());
-                            response.put("type", "init");
-                            response.put("side", sideStr);
+                botsLoadedLatch.await();
 
-                            var botsArray = mapper.createArrayNode();
-                            for (Map<String, Object> bot : ChessAutomator.BOTS) {
-                                ObjectNode b = mapper.createObjectNode();
-                                b.put("id", (Integer) bot.get("id"));
-                                b.put("name", (String) bot.get("name"));
-                                if (bot.containsKey("rating") && bot.get("rating") != null) {
-                                    b.put("rating", bot.get("rating").toString());
-                                }
-                                if (bot.containsKey("avatar")) {
-                                    b.put("avatar", (String) bot.get("avatar"));
-                                }
-                                b.put("is_engine", (Boolean) bot.get("is_engine"));
-                                botsArray.add(b);
-                            }
-                            response.set("bots", botsArray);
-                            response.set("current_bot", mapper.valueToTree(automator.getSelectedBot()));
-                            ObjectNode stateWrapper = mapper.createObjectNode();
-                            stateWrapper.setAll((ObjectNode) mapper.valueToTree(automator.getReadableBoardState(automator.getInitialState())));
-                            response.set("state", stateWrapper);
-
-                            session.sendMessage(new TextMessage(response.toString()));
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
-                    });
-                }
-
-                case "next_move" -> {
-                    ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
-                    if (automator == null) {
-                        session.sendMessage(new TextMessage("{\"error\":\"Bot not initialized.\"}"));
-                        return;
-                    }
-
-                    String opponentMove = data.has("opponent_move") && !data.get("opponent_move").isNull() ? data.get("opponent_move").asText() : null;
-                    if (opponentMove == null) {
-                        session.sendMessage(new TextMessage("{\"error\":\"Opponent move cannot be null.\"}"));
-                        return;
-                    }
-
-                    Map<java.lang.String, java.lang.Object> move = automator.getNextBestMove(opponentMove);
-
-                    ObjectNode response = mapper.createObjectNode();
+                if ((Boolean) automator.getEngineResult().get("engine_active")) {
+                    Map<String, Object> move = automator.getNextBestMove(null);
                     if (move != null) {
+                        ObjectNode response = mapper.createObjectNode();
                         ObjectNode moveNode = mapper.createObjectNode();
-                        final String piece = (String) move.get("piece"), from = (String) move.get("from"), to = (String) move.get("to");
-                        moveNode.put("piece", piece);
-                        moveNode.put("from", from);
-                        moveNode.put("to", to);
+                        moveNode.put("piece", (String) move.get("piece"));
+                        moveNode.put("from", (String) move.get("from"));
+                        moveNode.put("to", (String) move.get("to"));
+
                         response.set("move", moveNode);
                         response.put("type", "engine_move");
-                        response.put("status", piece + " to " + to);
+                        response.put("status", move.get("piece") + " to " + move.get("to"));
 
                         ObjectNode stateWrapper = mapper.createObjectNode();
                         stateWrapper.setAll((ObjectNode) mapper.valueToTree(move.get("state")));
                         response.set("state", stateWrapper);
-                    } else {
-                        response.put("error", "No valid moves found or game over.");
+
+                        safeSend(session, response.toString());
                     }
-                    session.sendMessage(new TextMessage(response.toString()));
                 }
 
-                case "promote" -> {
-                    ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
-                    if (automator == null) {
-                        session.sendMessage(new TextMessage("{\"error\":\"Bot not initialized.\"}"));
-                        return;
-                    }
-
-                    String piece = data.has("promote_to") ? data.get("promote_to").asText() : "q";
-                    automator.completePromotion(piece);
-
-                    ObjectNode response = mapper.createObjectNode();
-                    response.put("status", "Promoted to " + piece.toUpperCase());
-                    response.put("type", "promote");
-                    response.put("piece", piece);
-                    session.sendMessage(new TextMessage(response.toString()));
-                }
-
-                case "select_bot" -> {
-                    ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
-                    if (automator == null) {
-                        session.sendMessage(new TextMessage("{\"error\":\"Bot not initialized.\"}"));
-                        return;
-                    }
-
-                    int botId = data.has("bot_id") ? data.get("bot_id").asInt() : 0;
-                    Integer engineLevel = data.has("engine_level") && !data.get("engine_level").isNull() ? data.get("engine_level").asInt() : null;
-
-                    automator.selectBot(botId, engineLevel);
-
-                    ObjectNode response = mapper.createObjectNode();
-                    response.put("status", "Selected bot: " + automator.getSelectedBot().get("name"));
-                    response.put("type", "select_bot");
-                    response.put("current_bot", String.format("%s (Rating: %s)", automator.getSelectedBot().get("name"), automator.getSelectedBot().get("rating")));
-                    session.sendMessage(new TextMessage(response.toString()));
-                }
-
-                case "undo" -> {
-                    ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
-                    if (automator == null) {
-                        session.sendMessage(new TextMessage("{\"error\":\"Bot not initialized.\"}"));
-                        return;
-                    }
-
-                    automator.undoLastMove();
-
-                    ObjectNode response = mapper.createObjectNode();
-                    response.put("status", "Undid last move.");
-                    response.put("type", "undo");
-                    session.sendMessage(new TextMessage(response.toString()));
-                }
-
-                default -> session.sendMessage(new TextMessage("{\"error\":\"Unknown action\"}"));
+            } catch (Exception e) {
+                e.printStackTrace();
+                safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
             }
-        } catch (Exception e) {
-            e.printStackTrace();
-            session.sendMessage(new TextMessage("{\"error\":\"" + e.getMessage() + "\"}"));
-        }
+        });
+    }
+
+    private void handleNextMove(WebSocketSession session, JsonNode data) {
+        asyncExecutor.submit(() -> {
+            try {
+                ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
+                if (automator == null) {
+                    safeSend(session, "{\"error\":\"Bot not initialized.\"}");
+                    return;
+                }
+
+                String opponentMove = data.has("opponent_move") && !data.get("opponent_move").isNull() ? data.get("opponent_move").asText() : null;
+                if (opponentMove == null) {
+                    safeSend(session, "{\"error\":\"Opponent move cannot be null.\"}");
+                    return;
+                }
+
+                Map<String, Object> move = automator.getNextBestMove(opponentMove);
+                ObjectNode response = mapper.createObjectNode();
+
+                if (move != null) {
+                    ObjectNode moveNode = mapper.createObjectNode();
+                    moveNode.put("piece", (String) move.get("piece"));
+                    moveNode.put("from", (String) move.get("from"));
+                    moveNode.put("to", (String) move.get("to"));
+                    response.set("move", moveNode);
+                    response.put("type", "engine_move");
+                    response.put("status", move.get("piece") + " to " + move.get("to"));
+                    ObjectNode stateWrapper = mapper.createObjectNode();
+                    stateWrapper.setAll((ObjectNode) mapper.valueToTree(move.get("state")));
+                    response.set("state", stateWrapper);
+                } else {
+                    response.put("error", "No valid moves found or game over.");
+                }
+                safeSend(session, response.toString());
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+    }
+
+    private void handlePromote(WebSocketSession session, JsonNode data) {
+        asyncExecutor.submit(() -> {
+            try {
+                ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
+                if (automator == null) {
+                    safeSend(session, "{\"error\":\"Bot not initialized.\"}");
+                    return;
+                }
+
+                String piece = data.has("promote_to") ? data.get("promote_to").asText() : "q";
+                automator.completePromotion(piece);
+                ObjectNode response = mapper.createObjectNode();
+                response.put("status", "Promoted to " + piece.toUpperCase());
+                response.put("type", "promote");
+                response.put("piece", piece);
+                safeSend(session, response.toString());
+            } catch (Exception e) {
+                e.printStackTrace();
+                safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+    }
+
+    private void handleSelectBot(WebSocketSession session, JsonNode data) {
+        asyncExecutor.submit(() -> {
+            try {
+                ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
+                if (automator == null) {
+                    safeSend(session, "{\"error\":\"Bot not initialized.\"}");
+                    return;
+                }
+
+                int botId = data.has("bot_id") ? data.get("bot_id").asInt() : 0;
+                Integer engineLevel = data.has("engine_level") && !data.get("engine_level").isNull() ? data.get("engine_level").asInt() : null;
+                automator.selectBot(botId, engineLevel);
+
+                ObjectNode response = mapper.createObjectNode();
+                response.put("status", "Selected bot: " + automator.getSelectedBot().get("name"));
+                response.put("type", "select_bot");
+                response.put("current_bot", String.format("%s (Rating: %s)", automator.getSelectedBot().get("name"), automator.getSelectedBot().get("rating")));
+                safeSend(session, response.toString());
+            } catch (Exception e) {
+                e.printStackTrace();
+                safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+    }
+
+    private void handleUndo(WebSocketSession session) {
+        asyncExecutor.submit(() -> {
+            try {
+                ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
+                if (automator == null) {
+                    safeSend(session, "{\"error\":\"Bot not initialized.\"}");
+                    return;
+                }
+                automator.undoLastMove();
+                ObjectNode response = mapper.createObjectNode();
+                response.put("status", "Undid last move.");
+                response.put("type", "undo");
+                safeSend(session, response.toString());
+            } catch (Exception e) {
+                e.printStackTrace();
+                safeSend(session, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) {
-        ChessAutomator automator = (ChessAutomator) session.getAttributes().get("automator");
-        automator.quit();
+        Object obj = session.getAttributes().get("automator");
+        if (obj instanceof ChessAutomator automator) {
+            try {
+                automator.quit();
+            } catch (Exception ignored) {
+            }
+        }
         sessions.remove(session.getId());
         System.out.println("[WS] Client " + session.getId() + " disconnected.");
     }

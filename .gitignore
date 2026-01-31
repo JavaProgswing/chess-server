@@ -38,3 +38,5 @@ build/
 
 *.log
 .DS_Store
+
+selenium_cache
