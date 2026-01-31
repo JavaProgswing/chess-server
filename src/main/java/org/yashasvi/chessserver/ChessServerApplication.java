@@ -13,6 +13,11 @@ public class ChessServerApplication {
                 if (parts.length == 2) {
                     System.setProperty("selenium.mode", parts[1]);
                 }
+            } else if (arg.startsWith("--remote-url=")) {
+                String[] parts = arg.split("=", 2);
+                if (parts.length == 2) {
+                    System.setProperty("selenium.remote.url", parts[1]);
+                }
             }
         }
         SpringApplication.run(ChessServerApplication.class, args);
